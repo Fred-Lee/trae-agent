@@ -6,34 +6,34 @@ Ollama API client wrapper with tool integration
 """
 
 import json
+import uuid
 from typing import override
 
 import openai
-from ollama import chat as ollama_chat
+from ollama import chat as ollama_chat  # pyright: ignore[reportUnknownVariableType]
 from openai.types.responses import (
-    EasyInputMessageParam,
     FunctionToolParam,
     ResponseFunctionToolCallParam,
     ResponseInputParam,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput
 
-from ..tools.base import Tool, ToolCall, ToolResult
-from ..utils.config import ModelParameters
-from .base_client import BaseLLMClient
-from .llm_basics import LLMMessage, LLMResponse
-from .retry_utils import retry_with
+from trae_agent.tools.base import Tool, ToolCall, ToolResult
+from trae_agent.utils.config import ModelConfig
+from trae_agent.utils.llm_clients.base_client import BaseLLMClient
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
+from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
 class OllamaClient(BaseLLMClient):
-    def __init__(self, model_parameters: ModelParameters):
-        super().__init__(model_parameters)
+    def __init__(self, model_config: ModelConfig):
+        super().__init__(model_config)
 
         self.client: openai.OpenAI = openai.OpenAI(
             # by default ollama doesn't require any api key. It should set to be "ollama".
             api_key=self.api_key,
-            base_url=model_parameters.base_url
-            if model_parameters.base_url
+            base_url=model_config.model_provider.base_url
+            if model_config.model_provider.base_url
             else "http://localhost:11434/v1",
         )
 
@@ -45,7 +45,7 @@ class OllamaClient(BaseLLMClient):
 
     def _create_ollama_response(
         self,
-        model_parameters: ModelParameters,
+        model_config: ModelConfig,
         tool_schemas: list[FunctionToolParam] | None,
     ):
         """Create a response using Ollama API. This method will be decorated with retry logic."""
@@ -64,23 +64,22 @@ class OllamaClient(BaseLLMClient):
             ]
         return ollama_chat(
             messages=self.message_history,
-            model=model_parameters.model,
+            model=model_config.model,
             tools=tools_param,
-            # temperature=model_parameters.temperature,
-            # top_p=model_parameters.top_p,
-            # max_output_tokens=model_parameters.max_tokens,
         )
 
     @override
     def chat(
         self,
         messages: list[LLMMessage],
-        model_parameters: ModelParameters,
+        model_config: ModelConfig,
         tools: list[Tool] | None = None,
         reuse_history: bool = True,
     ) -> LLMResponse:
-        """Send chat messages to Ollama with optional tool support."""
-        openai_messages: ResponseInputParam = self.parse_messages(messages)
+        """
+        A rewritten version of ollama chan
+        """
+        msgs: ResponseInputParam = self.parse_messages(messages)
 
         tool_schemas = None
         if tools:
@@ -96,119 +95,53 @@ class OllamaClient(BaseLLMClient):
             ]
 
         if reuse_history:
-            self.message_history = self.message_history + openai_messages
+            self.message_history = self.message_history + msgs
         else:
-            self.message_history = openai_messages
+            self.message_history = msgs
 
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
             func=self._create_ollama_response,
-            service_name="Ollama",
-            max_retries=model_parameters.max_retries,
+            provider_name="Ollama",
+            max_retries=model_config.max_retries,
         )
-        response = retry_decorator(model_parameters, tool_schemas)
+        response = retry_decorator(model_config, tool_schemas)
 
-        content = response.message.content
+        content = ""
         tool_calls: list[ToolCall] = []
-        if response.message.tool_calls:
-            for output_block in response.message.tool_calls:
-                if hasattr(output_block, "name") and hasattr(output_block, "arguments"):
-                    tool_calls.append(
-                        ToolCall(
-                            call_id=output_block.call_id,
-                            name=output_block.name,
-                            arguments=json.loads(output_block.arguments)
-                            if output_block.arguments
-                            else {},
-                            id=output_block.id,
-                        )
-                    )
-                    tool_call_param = ResponseFunctionToolCallParam(
-                        arguments=output_block.arguments,
-                        call_id=output_block.call_id,
-                        name=output_block.name,
-                        type="function_call",
-                    )
-                    if output_block.status:
-                        tool_call_param["status"] = output_block.status
-                    if output_block.id:
-                        tool_call_param["id"] = output_block.id
-                    self.message_history.append(tool_call_param)
-                elif hasattr(output_block, "type") and output_block.type == "message":
-                    if hasattr(output_block, "content"):
-                        for content_block in output_block.content:
-                            if (
-                                hasattr(content_block, "type")
-                                and content_block.type == "output_text"
-                            ):
-                                content += content_block.text
 
-        if content != "":
-            self.message_history.append(
-                EasyInputMessageParam(content=content, role="assistant", type="message")
-            )
-        usage = None
-        # ollama doesn't provide usage
-        # TODO is there any method that we could actually count the token ?
-        """
-        usage = LLMUsage(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            cache_read_input_tokens=response.usage.input_tokens_details.cached_tokens,
-            reasoning_tokens=response.usage.output_tokens_details.reasoning_tokens,
-        )
-        """
+        if response.message.tool_calls:
+            for tool in response.message.tool_calls:
+                tool_calls.append(
+                    ToolCall(
+                        call_id=self._id_generator(),
+                        name=tool.function.name,
+                        arguments=dict(tool.function.arguments),
+                        id=self._id_generator(),
+                    )
+                )
+        else:
+            # consider response is not a tool call
+            content = str(response.message.content)
 
         llm_response = LLMResponse(
             content=content,
-            usage=usage,
-            model=response.model,
-            finish_reason=response.done_reason,
+            usage=None,
+            model=model_config.model,
+            finish_reason=None,  # seems can't get finish reason will check docs soon
             tool_calls=tool_calls if len(tool_calls) > 0 else None,
         )
 
-        # Record trajectory if recorder is available
         if self.trajectory_recorder:
             self.trajectory_recorder.record_llm_interaction(
                 messages=messages,
                 response=llm_response,
                 provider="ollama",
-                model=model_parameters.model,
+                model=model_config.model,
                 tools=tools,
             )
 
         return llm_response
-
-    @override
-    def supports_tool_calling(self, model_parameters: ModelParameters) -> bool:
-        """
-        Check if the current model supports tool calling.
-        TODO: there should be a more robust way to handle tool_support check or we have to manually type every supported model which is not really that feasible. for example deepseek familay has deepseek:1.5b deepseek:7b ...
-        """
-        tool_support_model = [
-            "deepseek-r1",
-            "qwen3",
-            "llama3.1",
-            "llama3.2",
-            "mistral",
-            "qwen2.5",
-            "qwen2.5-coder",
-            "mistral-nemo",
-            "llama3.3",
-            "qwq",
-            "mistral-small",
-            "mixtral",
-            "smollm2",
-            "llama4",
-            "command-r",
-            "hermes3",
-            "phi4-mini",
-            "granite3.3",
-            "devstral",
-            "mistral-small3.1",
-        ]
-
-        return any(model in model_parameters.model for model in tool_support_model)
 
     def parse_messages(self, messages: list[LLMMessage]) -> ResponseInputParam:
         """
@@ -257,3 +190,7 @@ class OllamaClient(BaseLLMClient):
             output=result,
             type="function_call_output",
         )
+
+    def _id_generator(self) -> str:
+        """Generate a random ID string"""
+        return str(uuid.uuid4())

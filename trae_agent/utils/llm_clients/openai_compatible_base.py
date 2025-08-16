@@ -1,10 +1,10 @@
 # Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
-"""OpenRouter API client wrapper with tool integration."""
+"""Base class for OpenAI-compatible clients with shared logic."""
 
 import json
-import os
+from abc import ABC, abstractmethod
 from typing import override
 
 import openai
@@ -24,21 +24,51 @@ from openai.types.chat.chat_completion_tool_message_param import (
 )
 from openai.types.shared_params.function_definition import FunctionDefinition
 
-from ..tools.base import Tool, ToolCall
-from ..utils.config import ModelParameters
-from .base_client import BaseLLMClient
-from .llm_basics import LLMMessage, LLMResponse, LLMUsage
-from .retry_utils import retry_with
+from trae_agent.tools.base import Tool, ToolCall
+from trae_agent.utils.config import ModelConfig
+from trae_agent.utils.llm_clients.base_client import BaseLLMClient
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
-class OpenRouterClient(BaseLLMClient):
-    """OpenRouter client wrapper with tool schema generation."""
+class ProviderConfig(ABC):
+    """Abstract base class for provider-specific configurations."""
 
-    def __init__(self, model_parameters: ModelParameters):
-        super().__init__(model_parameters)
+    @abstractmethod
+    def create_client(
+        self, api_key: str, base_url: str | None, api_version: str | None
+    ) -> openai.OpenAI:
+        """Create the OpenAI client instance."""
+        pass
 
-        # Use OpenAI SDK with OpenRouter's base URL
-        self.client: openai.OpenAI = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
+    @abstractmethod
+    def get_service_name(self) -> str:
+        """Get the service name for retry logging."""
+        pass
+
+    @abstractmethod
+    def get_provider_name(self) -> str:
+        """Get the provider name for trajectory recording."""
+        pass
+
+    @abstractmethod
+    def get_extra_headers(self) -> dict[str, str]:
+        """Get any extra headers needed for the API call."""
+        pass
+
+    @abstractmethod
+    def supports_tool_calling(self, model_name: str) -> bool:
+        """Check if the model supports tool calling."""
+        pass
+
+
+class OpenAICompatibleClient(BaseLLMClient):
+    """Base class for OpenAI-compatible clients with shared logic."""
+
+    def __init__(self, model_config: ModelConfig, provider_config: ProviderConfig):
+        super().__init__(model_config)
+        self.provider_config = provider_config
+        self.client = provider_config.create_client(self.api_key, self.base_url, self.api_version)
         self.message_history: list[ChatCompletionMessageParam] = []
 
     @override
@@ -46,20 +76,24 @@ class OpenRouterClient(BaseLLMClient):
         """Set the chat history."""
         self.message_history = self.parse_messages(messages)
 
-    def _create_openrouter_response(
+    def _create_response(
         self,
-        model_parameters: ModelParameters,
+        model_config: ModelConfig,
         tool_schemas: list[ChatCompletionToolParam] | None,
         extra_headers: dict[str, str] | None = None,
     ) -> ChatCompletion:
-        """Create a response using OpenRouter API. This method will be decorated with retry logic."""
+        """Create a response using the provider's API. This method will be decorated with retry logic."""
         return self.client.chat.completions.create(
-            model=model_parameters.model,
+            model=model_config.model,
             messages=self.message_history,
             tools=tool_schemas if tool_schemas else openai.NOT_GIVEN,
-            temperature=model_parameters.temperature,
-            top_p=model_parameters.top_p,
-            max_tokens=model_parameters.max_tokens,
+            temperature=model_config.temperature
+            if "o3" not in model_config.model
+            and "o4-mini" not in model_config.model
+            and "gpt-5" not in model_config.model
+            else openai.NOT_GIVEN,
+            top_p=model_config.top_p,
+            max_tokens=model_config.max_tokens,
             extra_headers=extra_headers if extra_headers else None,
             n=1,
         )
@@ -68,19 +102,18 @@ class OpenRouterClient(BaseLLMClient):
     def chat(
         self,
         messages: list[LLMMessage],
-        model_parameters: ModelParameters,
+        model_config: ModelConfig,
         tools: list[Tool] | None = None,
         reuse_history: bool = True,
     ) -> LLMResponse:
-        """Send chat messages to OpenRouter with optional tool support."""
-        openrouter_messages = self.parse_messages(messages)
+        """Send chat messages with optional tool support."""
+        parsed_messages = self.parse_messages(messages)
         if reuse_history:
-            self.message_history = self.message_history + openrouter_messages
+            self.message_history = self.message_history + parsed_messages
         else:
-            self.message_history = openrouter_messages
+            self.message_history = parsed_messages
 
         tool_schemas = None
-        # Add tools if provided
         if tools:
             tool_schemas = [
                 ChatCompletionToolParam(
@@ -94,24 +127,16 @@ class OpenRouterClient(BaseLLMClient):
                 for tool in tools
             ]
 
-        # Set up extra headers for OpenRouter
-        extra_headers: dict[str, str] = {}
-
-        openrouter_site_url = os.getenv("OPENROUTER_SITE_URL")
-        if openrouter_site_url:
-            extra_headers["HTTP-Referer"] = openrouter_site_url
-        openrouter_size_name = os.getenv("OPENROUTER_SITE_NAME")
-        if openrouter_size_name:
-            extra_headers["X-Title"] = openrouter_size_name
+        # Get provider-specific extra headers
+        extra_headers = self.provider_config.get_extra_headers()
 
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
-            func=self._create_openrouter_response,
-            service_name="OpenRouter",
-            max_retries=model_parameters.max_retries,
-            provider_name="openrouter",
+            func=self._create_response,
+            provider_name=self.provider_config.get_service_name(),
+            max_retries=model_config.max_retries,
         )
-        response = retry_decorator(model_parameters, tool_schemas, extra_headers)
+        response = retry_decorator(model_config, tool_schemas, extra_headers)
 
         choice = response.choices[0]
 
@@ -146,7 +171,7 @@ class OpenRouterClient(BaseLLMClient):
             ),
         )
 
-        # update message history
+        # Update message history
         if llm_response.tool_calls:
             self.message_history.append(
                 ChatCompletionAssistantMessageParam(
@@ -174,44 +199,26 @@ class OpenRouterClient(BaseLLMClient):
             self.trajectory_recorder.record_llm_interaction(
                 messages=messages,
                 response=llm_response,
-                provider="openrouter",
-                model=model_parameters.model,
+                provider=self.provider_config.get_provider_name(),
+                model=model_config.model,
                 tools=tools,
             )
 
         return llm_response
 
-    @override
-    def supports_tool_calling(self, model_parameters: ModelParameters) -> bool:
-        """Check if the current model supports tool calling."""
-        # Most modern models on OpenRouter support tool calling
-        # We'll be conservative and check for known capable models
-        tool_capable_patterns = [
-            "gpt-4",
-            "gpt-3.5-turbo",
-            "claude-3",
-            "claude-2",
-            "gemini",
-            "mistral",
-            "llama-3",
-            "command-r",
-        ]
-        return any(pattern in model_parameters.model.lower() for pattern in tool_capable_patterns)
-
     def parse_messages(self, messages: list[LLMMessage]) -> list[ChatCompletionMessageParam]:
-        openrouter_messages: list[ChatCompletionMessageParam] = []
+        """Parse LLM messages to OpenAI format."""
+        openai_messages: list[ChatCompletionMessageParam] = []
         for msg in messages:
             match msg:
                 case msg if msg.tool_call is not None:
-                    _msg_tool_call_handler(openrouter_messages, msg)
+                    _msg_tool_call_handler(openai_messages, msg)
                 case msg if msg.tool_result is not None:
-                    _msg_tool_result_handler(openrouter_messages, msg)
-                case msg if msg.role is not None:
-                    _msg_role_handler(openrouter_messages, msg)
+                    _msg_tool_result_handler(openai_messages, msg)
                 case _:
-                    raise ValueError(f"Invalid message: {msg}")
+                    _msg_role_handler(openai_messages, msg)
 
-        return openrouter_messages
+        return openai_messages
 
 
 def _msg_tool_call_handler(messages: list[ChatCompletionMessageParam], msg: LLMMessage) -> None:
